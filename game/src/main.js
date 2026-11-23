@@ -1,134 +1,304 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
+// main.js — Neon 21: a roguelite blackjack run. Start with 100 chips and
+// a four-deck shoe; bet, play the hand against the dealer, and reach the
+// 500-chip goal to win the run. Hit 0 chips, or let the shoe run dry below
+// the goal, and the run ends. After every three hands an event card bends
+// the rules of the next few hands. This file owns the run state and every
+// action; shoe.js knows cards, events.js the twists, render.js the table,
+// input.js the clicks and keys, audio.js the bleeps.
 //
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
+// Staged scenes for the screenshots: ?shot=start|play|end&seed=1 builds a
+// fixed, seeded table so the maker's renders are the same on every visit.
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
+import { buildShoe, handTotal, isBlackjack, makeRng } from './shoe.js';
+import { drawEvent } from './events.js';
+import { renderScene } from './render.js';
+import { attachInput } from './input.js';
+import { sfx, toggleMuted } from './audio.js';
 
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const START_CHIPS = 100;
+const GOAL_CHIPS = 500;
+const SHOE_MINIMUM = 10; // below this many cards the shoe counts as dry
 
-const canvas = document.getElementById('game');
+const canvas = document.getElementById('table');
+const ctx = canvas.getContext('2d');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
+let buttons = [];
+let state = null;
+
+function newRun(seed) {
+  const rng = makeRng(seed);
+  return {
+    mode: 'betting',
+    rng,
+    chips: START_CHIPS,
+    goal: GOAL_CHIPS,
+    bet: 0,
+    shoe: buildShoe(4, rng),
+    player: [],
+    dealer: [],
+    holeHidden: false,
+    handsPlayed: 0,
+    handsSinceEvent: 0,
+    biggestWin: 0,
+    event: null,        // {id, name, text, handsLeft} while a twist is live
+    pendingEvent: null, // the event card on show in 'event' mode
+    doubled: false,
+    bustRefunded: false,
+    message: '',
+    loseReason: '',
+  };
+}
+
+function hasEvent(id) {
+  return state.event && state.event.id === id;
+}
+
+function dealerStandTotal() {
+  return hasEvent('dealer-nerves') ? 16 : 17;
+}
+
+function drawCard() {
+  return state.shoe.pop();
+}
+
+function placeChip(value) {
+  if (state.chips < value) return;
+  state.chips -= value;
+  state.bet += value;
+  sfx.chip();
+}
+
+function clearBet() {
+  state.chips += state.bet;
+  state.bet = 0;
+  sfx.click();
+}
+
+function dealHand() {
+  if (state.bet <= 0) return;
+  state.player = [drawCard(), drawCard()];
+  state.dealer = [drawCard(), drawCard()];
+  state.holeHidden = true;
+  state.doubled = false;
+  state.bustRefunded = false;
+  state.message = '';
+  sfx.deal();
+  if (isBlackjack(state.player) || isBlackjack(state.dealer)) {
+    revealAndSettle();
+  } else {
+    state.mode = 'player';
   }
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
+function playerHit() {
+  if (state.mode !== 'player') return;
+  state.player.push(drawCard());
+  sfx.deal();
+  const { total } = handTotal(state.player);
+  if (total > 21) settleBust();
+  else if (total === 21) dealerPlay();
 }
 
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
+function playerStand() {
+  if (state.mode !== 'player') return;
+  dealerPlay();
 }
 
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
+function playerDouble() {
+  if (state.mode !== 'player' || state.player.length !== 2 || state.chips < state.bet) return;
+  state.chips -= state.bet;
+  state.bet *= 2;
+  state.doubled = true;
+  state.player.push(drawCard());
+  sfx.chip();
+  const { total } = handTotal(state.player);
+  if (total > 21) settleBust();
+  else dealerPlay();
+}
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
+function dealerPlay() {
+  state.holeHidden = false;
+  const standAt = dealerStandTotal();
+  while (handTotal(state.dealer).total < standAt) {
+    state.dealer.push(drawCard());
   }
+  revealAndSettle();
+}
 
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
+function settleBust() {
+  state.holeHidden = false;
+  if (hasEvent('insurance-fund') && !state.bustRefunded) {
+    const refund = Math.floor(state.bet / 2);
+    state.chips += refund;
+    state.bustRefunded = true;
+    finishHand(`Bust — the Insurance Fund refunds ${refund}.`, -state.bet + refund, false);
+    return;
   }
+  finishHand('Bust. The dealer takes your bet.', -state.bet, false);
+}
 
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
+// Works out who won once both hands are final and pays the table:
+// a win returns the bet plus its match, blackjack pays 3:2 (2:1 under
+// Hot Shoe), a push returns the bet, a loss keeps it.
+function revealAndSettle() {
+  state.holeHidden = false;
+  const playerTotal = handTotal(state.player).total;
+  const dealerTotal = handTotal(state.dealer).total;
+  const playerBj = isBlackjack(state.player);
+  const dealerBj = isBlackjack(state.dealer);
+  const bet = state.bet;
+
+  if (playerBj && dealerBj) return finishHand('Both blackjack — a push.', 0, false);
+  if (dealerBj) return finishHand('Dealer blackjack. Your bet is gone.', -bet, false);
+  if (playerBj) {
+    const profit = hasEvent('hot-shoe') ? bet * 2 : Math.floor(bet * 1.5);
+    state.chips += bet + profit;
+    return finishHand(`BLACKJACK! You win ${profit}.`, profit, true);
   }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
+  if (dealerTotal > 21) {
+    let profit = bet;
+    if (state.doubled && hasEvent('golden-double')) profit += Math.floor(bet / 2);
+    state.chips += bet + profit;
+    return finishHand(`Dealer busts with ${dealerTotal}. You win ${profit}.`, profit, true);
   }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+  if (playerTotal > dealerTotal) {
+    let profit = bet;
+    if (state.doubled && hasEvent('golden-double')) profit += Math.floor(bet / 2);
+    state.chips += bet + profit;
+    return finishHand(`Your ${playerTotal} beats the dealer's ${dealerTotal}. You win ${profit}.`, profit, true);
   }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
-      }
-    } else {
-      accumulator = 0;
-    }
-    renderer.draw(world.state, screen, best);
+  if (playerTotal < dealerTotal) {
+    return finishHand(`Dealer's ${dealerTotal} beats your ${playerTotal}.`, -bet, false);
   }
+  state.chips += bet;
+  return finishHand(`Push at ${playerTotal} — your bet comes back.`, 0, false);
+}
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
+function finishHand(message, net, won) {
+  state.message = message;
+  state.bet = 0;
+  state.handsPlayed++;
+  state.handsSinceEvent++;
+  if (net > state.biggestWin) state.biggestWin = net;
+  if (state.event) {
+    state.event.handsLeft--;
+    if (state.event.handsLeft <= 0) state.event = null;
+  }
+  if (won) sfx.win(); else if (net < 0) sfx.lose();
+  if (state.chips >= state.goal) {
+    state.mode = 'won';
+    sfx.blackjack();
+    return;
+  }
+  if (state.chips <= 0) {
+    state.loseReason = 'Out of chips — the house keeps the table.';
+    state.mode = 'lost';
+    return;
+  }
+  state.mode = 'settle';
+}
 
-  announce('Block Dodger. Press Space or click to start.');
+function nextHand() {
+  if (state.shoe.length < SHOE_MINIMUM) {
+    state.loseReason = 'The shoe ran dry before you reached the goal.';
+    state.mode = 'lost';
+    return;
+  }
+  state.player = [];
+  state.dealer = [];
+  state.message = '';
+  if (state.handsSinceEvent >= 3) {
+    state.handsSinceEvent = 0;
+    state.pendingEvent = drawEvent(state.rng);
+    state.mode = 'event';
+    sfx.event();
+    return;
+  }
+  state.mode = 'betting';
+}
+
+function acceptEvent() {
+  const def = state.pendingEvent;
+  state.pendingEvent = null;
+  if (def.id === 'thin-deck') {
+    state.shoe = buildShoe(4, state.rng);
+    state.message = 'Fresh shoe shuffled in.';
+  } else {
+    state.event = { id: def.id, name: def.name, text: def.text, handsLeft: def.hands };
+  }
+  sfx.click();
+  state.mode = 'betting';
+}
+
+function onAction(id) {
+  if (id === 'mute') { toggleMuted(); return; }
+  if (id.startsWith('chip-')) {
+    if (state.mode === 'betting') placeChip(Number(id.slice(5)));
+    return;
+  }
+  switch (id) {
+    case 'start-run': state = newRun((Math.random() * 1e9) | 0); sfx.click(); break;
+    case 'clear-bet': if (state.mode === 'betting') clearBet(); break;
+    case 'deal': if (state.mode === 'betting') dealHand(); break;
+    case 'hit': playerHit(); break;
+    case 'stand': playerStand(); break;
+    case 'double': playerDouble(); break;
+    case 'next-hand': if (state.mode === 'settle') nextHand(); break;
+    case 'accept-event': if (state.mode === 'event') acceptEvent(); break;
+  }
+  status.textContent = `Neon 21 — chips ${state.chips}, bet ${state.bet}, mode ${state.mode}.`;
+}
+
+// --- staged scenes for the maker's screenshots ---------------------------
+
+function stagedState(shot, seed) {
+  const s = newRun(seed);
+  if (shot === 'start') {
+    s.mode = 'title';
+    return s;
+  }
+  if (shot === 'play') {
+    // A run mid-flight: six hands in, a Hot Shoe event live, 25 on the
+    // table and a player 18 against the dealer's ace.
+    s.chips = 150;
+    s.bet = 25;
+    s.handsPlayed = 6;
+    s.handsSinceEvent = 1;
+    s.biggestWin = 75;
+    s.event = { id: 'hot-shoe', name: 'HOT SHOE', text: 'Blackjack pays 2:1 for the next 3 hands.', handsLeft: 2 };
+    s.player = [{ rank: 13, suit: 'spades' }, { rank: 8, suit: 'hearts' }];
+    s.dealer = [{ rank: 1, suit: 'diamonds' }, { rank: 6, suit: 'clubs' }];
+    s.holeHidden = true;
+    s.shoe = s.shoe.slice(0, 163);
+    s.mode = 'player';
+    return s;
+  }
+  // 'end': the run is won.
+  s.chips = 540;
+  s.handsPlayed = 23;
+  s.biggestWin = 150;
+  s.mode = 'won';
+  return s;
+}
+
+// --- boot -----------------------------------------------------------------
+
+const params = new URLSearchParams(location.search);
+const shot = params.get('shot');
+if (shot) {
+  state = stagedState(shot, Number(params.get('seed') ?? 1));
+} else {
+  state = newRun((Math.random() * 1e9) | 0);
+  state.mode = 'title';
+}
+
+attachInput(canvas, { onAction, getButtons: () => buttons });
+
+function frame() {
+  buttons = renderScene(ctx, state);
   requestAnimationFrame(frame);
 }
+requestAnimationFrame(frame);
 
-if (shot) runShot(shot);
-else runGame();
+window.__neon21 = { get state() { return state; }, onAction };
